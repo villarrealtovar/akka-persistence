@@ -1,4 +1,4 @@
-name := "udemy-akka-persistence-starter"
+name := "akka-persistence-starter"
 
 version := "0.1"
 
