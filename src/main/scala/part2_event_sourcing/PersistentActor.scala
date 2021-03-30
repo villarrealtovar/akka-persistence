@@ -1,6 +1,6 @@
 package part2_event_sourcing
 
-import akka.actor.{ActorLogging, ActorSystem, Props}
+import akka.actor.{ActorLogging, ActorSystem, PoisonPill, Props}
 import akka.persistence.PersistentActor
 
 import java.util.Date
@@ -13,6 +13,8 @@ object PersistentActor extends App {
 
   // This will be the COMMAND for this accountant
   case class Invoice(recipient: String, date: Date, amount: Int)
+  case class InvoiceBulk(invoices: List[Invoice])
+  case object ShutDown
 
   // EVENTS
   case class InvoiceRecorded(id: Int, recipient: String, date: Date, amount: Int)
@@ -76,7 +78,32 @@ object PersistentActor extends App {
           sender() ! "Persistence ACK"
           log.info(s"Persisted $e as invoice #${e.id}, for total amount $totalAmount")
         }
-        // act like a normal actor
+      case InvoiceBulk(invoices) =>
+        /*
+          Follow the predefined pattern:
+
+          1) create events (plural)
+          2) persist all the events
+          3) update the actor state when each event is persisted
+         */
+        val invoiceIds = latestInvoiceId to (latestInvoiceId + invoices.size)
+        val events = invoices.zip(invoiceIds).map { pair =>
+          val invoice = pair._1
+          val id = pair._2
+
+          InvoiceRecorded(id, invoice.recipient, invoice.date, invoice.amount)
+        }
+
+        // Note: the `persistAll` callback is executed after each event has been successfully
+        // written to the journal.
+        persistAll(events) { e => // `e` is of type InvoiceRecord
+          latestInvoiceId += 1
+          totalAmount += e.amount
+          log.info(s"Persisted SINGLE $e as invoice #${e.id}, for total amount $totalAmount")
+        }
+      case ShutDown =>
+        context.stop(self)
+      // act like a normal actor
       case "print" => log.info(s"Lates invoice id: $latestInvoiceId, total amount: $totalAmount")
     }
 
@@ -92,12 +119,81 @@ object PersistentActor extends App {
         totalAmount += amount
         log.info(s"Recovered invoice #$id for amount $amount, total amount: $totalAmount")
     }
+
+    /*
+    * This method is called if persisting failed.
+    * The actor will be STOPPED regardless of the supervision strategy: the reason is that
+    * since you don't know if the event was persisted or not the actor is in an inconsistent
+    * state. So it cannot be trusted even if it's resumed. When this happens it's a good idea
+    * to start the actor again after a while. In the backoff Supervisor Pattern is useful here.
+    *
+    * Best Practice: start the actor again after a while (use Backoff Supervisor Pattern)
+    *
+    * This particular scenario is extremely hard to reproduce because persisting almost never
+    * throws, but it's good to know if persisting fails what to do.
+    * */
+    override def onPersistFailure(cause: Throwable, event: Any, seqNr: Long): Unit = {
+      log.error(s"Fail to persist $event because of $cause")
+      super.onPersistFailure(cause, event, seqNr)
+    }
+
+    /*
+     * Called if the JOURNAL throws an exception while persisting the event (fails to persist the event)
+     *
+     * The actor is RESUMED because the actor's state wasn't corrupted in the process.
+     *
+     * This is scenario is very hard to test because the Journals that we use are pretty robust
+     * and almost never thrown exception.
+     * */
+    override def onPersistRejected(cause: Throwable, event: Any, seqNr: Long): Unit = {
+      log.error(s"Fail to persist $event because of $cause")
+      super.onPersistRejected(cause, event, seqNr)
+    }
   }
 
   val system = ActorSystem("PersistentActors")
   val accountant = system.actorOf(Props[Accountant], "simpleAccountant")
 
-  /* for(i <- 1 to 10) {
+  for(i <- 1 to 10) {
     accountant ! Invoice("The Boring Company", new Date, i * 1000)
-  } */
+  }
+
+  /**
+    A. Persistence failures
+
+    There are tow type of persistence failures that we want to discuss:
+    1) failures to persist in the `persist` method call throws an error
+    2) the Journal implementation actually fails to persist a message
+
+    * */
+
+  /**
+    B. Persisting multiple events
+
+    Scenario: for some reason, you want to send a bulk message, so a list of
+    invoices to the Accountant Actor, so that it can persist multiple
+    invoiceRecorded events at the same time.
+
+    The solution is `persistAll`
+
+    * */
+    val newInvoices = for( i <- 1 to 5) yield Invoice("The awesome chairs", new Date, i *2000)
+    // accountant ! InvoiceBulk(newInvoices.toList)
+
+  /*
+      NEVER EVER CALL PERSIST OR PERSISTALL FROM FUTURES: Otherwise you risk breaking the
+      actor encapsulation because the actor thread is free to process messages while
+      you're persisting and, if the normal actor thread also calls persist you suddenly have
+      two threads persisting events simultaneously. So, because the event order is non-deterministic
+      you risk corrupting the actor state.
+   */
+
+  /**
+    C. Shutdown of persistent actors
+
+    Best Practice: define your own shutdown message
+    * */
+
+  // accountant ! PoisonPill
+  accountant ! ShutDown
 }
