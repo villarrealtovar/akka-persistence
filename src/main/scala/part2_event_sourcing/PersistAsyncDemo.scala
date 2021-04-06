@@ -74,9 +74,15 @@ object PersistAsyncDemo extends App {
 
     persistAsync is good.
     - performance: high-throughput environment
+    - Command Sourcing: The technique of persisting command directly without creating additional events.
+      Well, this is a natural fit for persistAsync because in these high throughput environemnts and often
+      doesn't make sense to create additional events, but rather persist commands directly and as fast as
+      possible.
 
     persistAsync is bad.
     - when you absolutely need the ordering of events: for example, when the state depends on it.
       (no offer ordering guarantees)
     */
+
+
 }
